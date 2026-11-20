@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from .sandbox.session.sandbox_client import BaseSandboxClient
     from .sandbox.session.sandbox_session_state import SandboxSessionState
     from .sandbox.snapshot import SnapshotBase, SnapshotSpec
-    from .tool import Tool
+    from .tool import NativeTool, Tool
 
 
 DEFAULT_MAX_TURNS = 10
@@ -142,11 +142,11 @@ OutputGuardrailBlockedMessageFormatter = Callable[
 
 @dataclass
 class ToolCallHookContext(Generic[TContext]):
-    """One SDK-executed tool call, available to input and output hooks in the host process."""
+    """A tool call observed by a preparation callback in the host process."""
 
     run_context: RunContextWrapper[TContext]
     agent: Agent[TContext]
-    tool: Tool
+    tool: Tool | NativeTool
     call_id: str
     tool_namespace: str | None
     arguments: dict[str, Any]
@@ -159,13 +159,13 @@ class ToolCallHookContext(Generic[TContext]):
 
 @dataclass
 class ToolExecutionConfig:
-    """Configure SDK-side execution of local tool calls.
+    """Configure tool execution and run-wide preparation callbacks.
 
-    Preparation callbacks run in the host process for SDK-executed tools, including local MCP.
-
-    With either callback set, `CodexProvider` disables its native workspace tools. Supply a local
-    `ShellTool`, `ApplyPatchTool`, or `Agent.mcp_servers` to expose those tools through the SDK.
-    Hosted API tools execute outside these callbacks.
+    Callbacks cover SDK-executed tools and native tools for which Codex emits tool hooks.
+    Codex reports native shell and patch inputs as `{"command": ...}`. A native output hook can
+    return the original result or replacement text for the model. API-hosted tools execute
+    outside the client hook lifecycle. Codex can execute a native tool if its hook transport fails.
+    Use an SDK executor when a callback must succeed before a side effect can occur.
 
     Supply the same callbacks when resuming a run in another process.
     """
@@ -189,7 +189,9 @@ class ToolExecutionConfig:
     """Return the arguments to approve and execute. Return `call.arguments` to pass them through.
 
     The runner awaits this callback for a new call so the approver sees what the tool will execute.
-    Resuming an approved call reuses those arguments. `on_tool_start` runs after approval.
+    Approved SDK calls reuse those arguments on resume. SDK tools call `on_tool_start` after
+    approval. Codex calls it from its native pre-tool event, before its own permission checks.
+    Responses executes hosted tools such as web search inside the API, outside this callback.
 
     Raw provider stream events and provider-managed history may contain the original proposal.
     """
@@ -199,11 +201,18 @@ class ToolExecutionConfig:
 
     The runner awaits this callback before function-tool output guardrails and before building the
     tool-output item used for history and later model turns. `on_tool_end` observes the accepted
-    result after that item is built, and the runner ignores its return value.
+    result after that item is built. For native tools it observes the prepared value before Codex
+    returns it to the model. Both executors ignore the observer's return value.
+    Responses-hosted tools such as file search return results to the model outside this callback.
 
     Return the received result to pass it through. Return a copyable value to isolate concurrent
     calls. Function tools use their normal output validation and serialization. Shell tools accept
     text or `ShellResult`. Editors and custom tools use text. Computer tools use base64 screenshots.
+    """
+
+    sdk_only_tool_hooks: bool = False
+    """Use classic SDK-only hooks. With a preparation callback configured, the Codex provider
+    disables its native workspace tools and uses the agent's SDK tools instead.
     """
 
     def __post_init__(self) -> None:
@@ -213,6 +222,8 @@ class ToolExecutionConfig:
             raise ValueError("tool_execution.max_function_tool_concurrency must be at least 1")
         if not isinstance(self.pre_approval_tool_input_guardrails, bool):
             raise ValueError("tool_execution.pre_approval_tool_input_guardrails must be a bool")
+        if not isinstance(self.sdk_only_tool_hooks, bool):
+            raise ValueError("tool_execution.sdk_only_tool_hooks must be a bool")
 
 
 @dataclass
