@@ -388,6 +388,38 @@ class ChatCmplStreamHandler:
         )
         return template_chunk.model_copy(update={"choices": [choice], "usage": None})
 
+    @staticmethod
+    async def _index_tool_call_deltas(
+        stream: AsyncIterator[ChatCompletionChunk],
+    ) -> AsyncIterator[ChatCompletionChunk]:
+        """Give every streamed tool-call delta of choice 0 an index.
+
+        OpenAI always sends ``index``. Some OpenAI-compatible servers (Gemini's OpenAI
+        endpoint, Mistral) send each tool call whole with only an ``id``; keyed on a missing
+        index, parallel calls would be merged into one. A delta with an id not seen yet starts
+        a new call, and a delta without an id continues the latest one.
+        """
+        index_by_id: dict[str, int] = {}
+        seen: set[int] = set()
+        last_index: int | None = None
+        async for chunk in stream:
+            for choice in chunk.choices or []:
+                if choice.index != 0 or not choice.delta or not choice.delta.tool_calls:
+                    continue
+                for tool_call_delta in choice.delta.tool_calls:
+                    if tool_call_delta.index is None:
+                        if tool_call_delta.id and tool_call_delta.id in index_by_id:
+                            tool_call_delta.index = index_by_id[tool_call_delta.id]
+                        elif tool_call_delta.id or last_index is None:
+                            tool_call_delta.index = max(seen) + 1 if seen else 0
+                        else:
+                            tool_call_delta.index = last_index
+                    if tool_call_delta.id:
+                        index_by_id.setdefault(tool_call_delta.id, tool_call_delta.index)
+                    seen.add(tool_call_delta.index)
+                    last_index = tool_call_delta.index
+            yield chunk
+
     @classmethod
     async def buffer_tool_call_stream(
         cls,
@@ -399,7 +431,7 @@ class ChatCmplStreamHandler:
         saw_passthrough_tool_call = False
         last_chunk: ChatCompletionChunk | None = None
 
-        async for chunk in stream:
+        async for chunk in cls._index_tool_call_deltas(stream):
             last_chunk = chunk
 
             if not chunk.choices:
@@ -643,7 +675,7 @@ class ChatCmplStreamHandler:
         saw_content_filter = False
         saw_length = False
         saw_finish_reason = False
-        async for chunk in stream:
+        async for chunk in cls._index_tool_call_deltas(stream):
             if not state.started:
                 state.started = True
                 yield ResponseCreatedEvent(

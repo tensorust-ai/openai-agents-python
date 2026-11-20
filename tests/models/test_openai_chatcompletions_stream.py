@@ -654,6 +654,83 @@ async def test_stream_handler_rejects_nonzero_choice_index_in_strict_mode() -> N
             pass
 
 
+def _gemini_openai_parallel_tool_call_chunks() -> list[ChatCompletionChunk]:
+    # Recorded from Gemini's OpenAI-compatible endpoint (pydantic-ai cassette
+    # test_compatible_api_gemini_3_tool_call_thought_signature[True]): two parallel calls,
+    # each whole in its own chunk, and neither delta has an `index`. The OpenAI SDK builds
+    # stream chunks without validation, so the missing index arrives as None, as here.
+    base = {
+        "id": "3tXOasW2I-2KmtkPrtulEA",
+        "object": "chat.completion.chunk",
+        "created": 1791940062,
+        "model": "gemini-3.1-flash-lite",
+    }
+    calls = [("call_108766", '{"city":"Taipei"}'), ("call_108772", '{"city":"Kaohsiung"}')]
+    chunks = [
+        ChatCompletionChunk.construct(
+            **base,
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": arguments},
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+        for call_id, arguments in calls
+    ]
+    chunks.append(
+        ChatCompletionChunk.construct(
+            **base,
+            choices=[{"index": 0, "delta": {"role": "assistant"}, "finish_reason": "stop"}],
+        )
+    )
+    return chunks
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_keeps_parallel_tool_calls_without_index_apart() -> None:
+    events = await _collect_handler_events(*_gemini_openai_parallel_tool_call_chunks())
+
+    completed = [event for event in events if event.type == "response.completed"]
+    assert len(completed) == 1
+    calls = [
+        (item.call_id, item.name, item.arguments)
+        for item in completed[0].response.output
+        if item.type == "function_call"
+    ]
+    assert calls == [
+        ("call_108766", "get_weather", '{"city":"Taipei"}'),
+        ("call_108772", "get_weather", '{"city":"Kaohsiung"}'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_keeps_tool_calls_without_index_apart() -> None:
+    buffered_chunks = await _collect_buffered_tool_call_chunks(
+        *_gemini_openai_parallel_tool_call_chunks()
+    )
+
+    tool_calls = [
+        (tool_call.id, tool_call.function.arguments if tool_call.function else None)
+        for chunk in buffered_chunks
+        for choice in chunk.choices
+        for tool_call in (choice.delta.tool_calls or [])
+    ]
+    assert tool_calls == [
+        ("call_108766", '{"city":"Taipei"}'),
+        ("call_108772", '{"city":"Kaohsiung"}'),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_buffer_tool_call_stream_merges_provider_metadata() -> None:
     tool_call_delta1 = ChoiceDeltaToolCall(
